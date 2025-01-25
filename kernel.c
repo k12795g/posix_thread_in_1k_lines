@@ -30,6 +30,24 @@ unsigned blk_capacity;
 struct file files[FILES_MAX];
 uint8_t disk[DISK_MAX_SIZE];
 
+struct process *current_proc; // Currently running process
+struct process *idle_proc;    // Idle process
+struct thread *current_thread; // Currently running thread
+struct thread idle_thread;    // Idle thread
+
+
+
+
+
+void delay(void) {
+    for (int i = 0; i < 300000000; i++)
+        __asm__ __volatile__("nop"); // do nothing
+}
+
+
+
+
+
 int oct2int(char *oct, int len) {
     int dec = 0;
     for (int i = 0; i < len; i++) {
@@ -238,8 +256,6 @@ void read_write_disk(void *buf, unsigned sector, int is_write) {
         memcpy(buf, blk_req->data, SECTOR_SIZE);
 }
 
-struct process *current_proc; // Currently running process
-struct process *idle_proc;    // Idle process
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -277,6 +293,19 @@ __attribute__((naked)) void user_entry(void) {
     );
 }
 
+
+__attribute__((naked)) void user_entry_for_thread(void) {
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]\n"
+        "csrw sstatus, %[sstatus]\n"
+        "sret\n"
+        :
+        : [sstatus] "r" (SSTATUS_SPIE | SSTATUS_SUM),
+          [sepc] "r" (current_thread->func)
+    );
+}
+
+
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
     if (!is_aligned(vaddr, PAGE_SIZE))
         PANIC("unaligned vaddr %x", vaddr);
@@ -298,105 +327,224 @@ void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
 }
 
 void yield(void) {
-    // Search for a runnable process
-    struct process *next = idle_proc;
-    for (int i = 0; i < PROCS_MAX; i++) {
-        struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
-        if (proc->state == PROC_RUNNABLE && proc->pid > 0) {
-            next = proc;
-            break;
+    struct thread *next_thread = NULL;
+    // 從目前執行的 thread 開始往下找
+    // current_proc -> current_thread
+    // 這裡的演算法可自由實作 (Round Robin、或用多重迴圈)
+    int start_pid = current_proc->pid;
+
+
+    int start_tid = current_thread->tid;
+
+
+    // printf("HHHHHHHHHHHH!\n");
+    // printf("look before find next thread");
+    for (int p = 0; p < PROCS_MAX; p++) {
+        // 避免 magic number，先計算下一個 index
+        printf("p: %d\n", (start_pid + p + 1) % PROCS_MAX);
+        int idx_proc = (start_pid + p + 1) % PROCS_MAX;
+        struct process *proc = &procs[idx_proc];
+        printf("proc->state: %d\n", proc->state);
+        printf("proc->pid: %d\n", proc->pid);
+        if (proc->state == PROC_UNUSED || proc->state == PROC_EXITED || proc->pid < 0)
+            continue;
+
+        for (int t = 0; t < THREADS_MAX; t++) {
+            int idx_thr = (start_tid + t + 1) % THREADS_MAX;
+            struct thread *thr = &proc->threads[idx_thr];
+            printf("t: %d, state: %d\n", (start_tid + t + 1) % THREADS_MAX, thr->state);
+            if (thr->state == THREAD_RUNNABLE) {
+                if (thr->parent->pid == current_proc->pid && thr->tid == current_thread->tid){
+                    next_thread = thr;
+                    printf("find himself\n");
+                    continue;
+                }
+                next_thread = thr;
+                printf("bbbreak\n");
+                break;
+            }
         }
+        if (next_thread)
+            break;
+    }
+    printf("end for\n");
+    // printf("line 381, next_thread = %d, current_thread = %d\n", next_thread->tid, next_thread->parent->pid);
+    // printf("look after find next thread");
+    if (!next_thread) {
+        // 找不到任何 RUNNABLE 的 thread，就執行 idle
+        // printf("no runnable thread, running idle\n");
+        next_thread = &idle_thread;
+        // idle_thread 可以是 tid = -1, state = RUNNABLE, 但不做事
     }
 
-    // If there's no runnable process other than the current one, return and continue processing
-    if (next == current_proc)
+    // printf("%d\n",next_thread == current_thread);
+    // 若跟當前執行的 thread 相同，就不用切換
+    if (next_thread == current_thread){
+        printf("next_thread == current_thread\n");
         return;
+    }
+    delay();
 
+    // printf("HHHBBBBBBHH!\n");
+    // printf("line 398\n");
+    // printf("look in the middle of yield");
+    // 重要：要確保 CPU 的 satp 維持成 next_thread->parent->page_table
+    // 以確保在 user 态執行時能夠存取正確的虛擬記憶體空間
     __asm__ __volatile__(
         "sfence.vma\n"
         "csrw satp, %[satp]\n"
         "sfence.vma\n"
-        "csrw sscratch, %[sscratch]\n"
+        // ...
         :
-        // Don't forget the trailing comma!
-        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
-          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next_thread->parent->page_table / PAGE_SIZE))
     );
 
-    // Context switch
-    struct process *prev = current_proc;
-    current_proc = next;
-    switch_context(&prev->sp, &next->sp);
+
+    // printf("switching from thread %d in process %d to thread %d in process %d\n",
+    //        current_thread->tid, current_proc->pid, next_thread->tid, next_thread->parent->pid);
+
+    // 執行 context switch
+    struct thread *prev_thread = current_thread;
+    current_proc = next_thread->parent;   // 也要更新 current_proc
+    current_thread = next_thread;
+
+    printf("next_thread->pid: %d, next_thread->tid: %d \n", next_thread->parent->pid, next_thread->tid);
+    printf("prev_thread->pid: %d, prev_thread->tid: %d \n", prev_thread->parent->pid, prev_thread->tid);
+    printf("prev_thread->sp: %x\n", prev_thread->sp);
+    printf("next_thread->sp: %x\n", next_thread->sp);
+    printf("new paremeter current_thread->func: %x\n", current_thread->func);
+    switch_context(&prev_thread->sp, &next_thread->sp);
+    printf("look after switch context\n");
 }
 
-struct process *create_process(const void *image, size_t image_size) {
-    // Find an unused process control structure.
-    struct process *proc = NULL;
-    int i;
-    for (i = 0; i < PROCS_MAX; i++) {
-        if (procs[i].state == PROC_UNUSED) {
-            proc = &procs[i];
+
+void thread_exit(void) {
+    printf("thread %d in process %d exit\n", current_thread->tid, current_proc->pid);
+    current_thread->state = THREAD_EXITED;
+    yield();
+    // 不應該回到這裡
+    PANIC("unreachable");
+}
+
+struct thread *create_thread(struct process *proc, void (*entry_func)(void)) {
+    // 找一個還沒使用的 thread
+    struct thread *t = NULL;
+    for (int i = 0; i < THREADS_MAX; i++) {
+        if (proc->threads[i].state == THREAD_UNUSED) {
+            t = &proc->threads[i];
             break;
         }
     }
+    if (!t) {
+        printf("no free thread slots in process %d\n", proc->pid);
+        return NULL;
+    }
 
+    // 初始化堆疊 (切換前先把 s0~s11, ra 等 callee-saved 都清空)
+    uint32_t *sp = (uint32_t *) &t->stack[sizeof(t->stack)];
+    *--sp = 0;  // s11
+    *--sp = 0;  // s10
+    *--sp = 0;  // s9
+    *--sp = 0;  // s8
+    *--sp = 0;  // s7
+    *--sp = 0;  // s6
+    *--sp = 0;  // s5
+    *--sp = 0;  // s4
+    *--sp = 0;  // s3
+    *--sp = 0;  // s2
+    *--sp = 0;  // s1
+    *--sp = 0;  // s0
+    *--sp = (uint32_t) user_entry_for_thread; // ra = 執行緒開始的函式入口
+
+    // 設定 thread 基本資訊
+    t->tid = proc->next_tid++;
+    t->state = THREAD_RUNNABLE;
+    t->sp = (uint32_t) sp;
+    t->parent = proc;
+    t->func = (uint32_t) entry_func;
+
+    printf("created thread %d in process %d\n", t->tid, proc->pid);
+    printf("t->func: %x\n", t->func);
+    return t;
+}
+
+struct process *create_process(const void *image, size_t image_size) {
+    // 1. 尋找一個尚未使用的 process slot
+    struct process *proc = NULL;
+    int curr_pid = 0;
+    for (int i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            curr_pid = i + 1;
+            break;
+        }
+    }
     if (!proc)
         PANIC("no free process slots");
 
-    // Stack callee-saved registers. These register values will be restored in
-    // the first context switch in switch_context.
-    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) user_entry;  // ra (changed!)
+    // 2. 初始化此 process 的基本欄位
+    memset(proc, 0, sizeof(*proc));
+    proc->pid   = -1;                 // 先設定成 -1 表示暫時無效
+    proc->state = PROC_RUNNABLE;      // 標記為可執行 (或者自行定義其他初始化流程)
+    proc->next_tid = 1;               // 從 1 開始分配 thread id
 
+    // 3. 建立「主 thread 」
+    struct thread *main_thread = &proc->threads[0];
+    memset(main_thread, 0, sizeof(*main_thread));
+    main_thread->tid   = proc->next_tid++;
+    main_thread->state = THREAD_RUNNABLE;
+    main_thread->parent = proc;
 
-    // Map kernel pages.
+    // 3.1 設定主 thread 的 kernel stack
+    uint32_t *sp = (uint32_t *)(&main_thread->stack[sizeof(main_thread->stack)]);
+    // 模擬原本對 callee-saved 的初始化 (s0~s11 + ra)
+    *--sp = 0;                     // s11
+    *--sp = 0;                     // s10
+    *--sp = 0;                     // s9
+    *--sp = 0;                     // s8
+    *--sp = 0;                     // s7
+    *--sp = 0;                     // s6
+    *--sp = 0;                     // s5
+    *--sp = 0;                     // s4
+    *--sp = 0;                     // s3
+    *--sp = 0;                     // s2
+    *--sp = 0;                     // s1
+    *--sp = 0;                     // s0
+    *--sp = (uint32_t) user_entry; // ra
+    main_thread->sp = (uint32_t) sp;
+
+    // 4. 建立與設定 page table
     uint32_t *page_table = (uint32_t *) alloc_pages(1);
     for (paddr_t paddr = (paddr_t) __kernel_base;
-         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+    // 需要的周邊 I/O 映射 (例如 virtio-blk)
+    map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W);
 
-    map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W); // new
-
-    // Map user pages.
+    // 5. 載入使用者程式 image
     for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
         paddr_t page = alloc_pages(1);
 
-        // Handle the case where the data to be copied is smaller than the
-        // page size.
         size_t remaining = image_size - off;
-        size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+        size_t copy_size = (PAGE_SIZE < remaining) ? PAGE_SIZE : remaining;
 
-        // Fill and map the page.
         memcpy((void *) page, image + off, copy_size);
         map_page(page_table, USER_BASE + off, page,
                  PAGE_U | PAGE_R | PAGE_W | PAGE_X);
     }
 
-    // Initialize fields.
-    printf("created process %d\n", i + 1);
-    proc->pid = i + 1;
-    proc->state = PROC_RUNNABLE;
-    proc->sp = (uint32_t) sp;
+    // 6. 完成 process 建立
+    proc->pid = curr_pid;          // 讓 process pid = [1..PROCS_MAX]
     proc->page_table = page_table;
+
+    printf("created process %d with main_thread(tid=%d)\n",
+           proc->pid, main_thread->tid);
+    printf("curr_pid:%d \n",curr_pid);
+
     return proc;
 }
 
-void delay(void) {
-    for (int i = 0; i < 30000000; i++)
-        __asm__ __volatile__("nop"); // do nothing
-}
 
 struct process *proc_a;
 struct process *proc_b;
@@ -417,6 +565,19 @@ void proc_b_entry(void) {
     }
 }
 
+void debug_print1(uint32_t value, uint32_t value2) {
+    printf("Debug: Register value1 = 0x%x, value2 = 0x%x\n", value, value2);
+}
+
+
+void debug_print2(uint32_t value) {
+    printf("Debug: Register value2 = 0x%x\n", value);
+}
+
+
+void debug_print3(uint32_t value) {
+    printf("Debug: Register value3 = 0x%x\n", value);
+}
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
     paddr_t paddr = next_paddr;
@@ -434,9 +595,17 @@ __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
         // Retrieve the kernel stack of the running process from sscratch.
-        "csrrw sp, sscratch, sp\n"
 
+        // "csrr a0, sscratch\n"
+        // "call debug_print1\n"
+
+        // "mv a0, sp\n"
+        // "call debug_print2\n"
+
+        "csrrw sp, sscratch, sp\n"
         "addi sp, sp, -4 * 31\n"
+        // "mv a0, sp\n"
+        // "call debug_print3\n"
         "sw ra,  4 * 0(sp)\n"
         "sw gp,  4 * 1(sp)\n"
         "sw tp,  4 * 2(sp)\n"
@@ -531,6 +700,21 @@ void handle_syscall(struct trap_frame *f) {
             current_proc->state = PROC_EXITED;
             yield();
             PANIC("unreachable");
+            break;
+        case SYS_YIELD:
+            yield();
+            break;
+        case SYS_CREATE_THREAD:{
+            void *func = (void*) f->a0; // user 提供的函式起始
+            // 在 current_proc 建立 thread
+            struct thread *t = create_thread(current_proc, func);
+            if (!t) {
+                f->a0 = -1; // 失敗
+            } else {
+                f->a0 = t->tid; // 回傳新 thread 的 tid
+            }
+            break;
+        }
         case SYS_GETCHAR:
             while (1) {
                 long ch = getchar();
@@ -580,6 +764,7 @@ void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
     uint32_t user_pc = READ_CSR(sepc);
+    // printf("trap: scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
     if (scause == SCAUSE_ECALL) {
         handle_syscall(f);
         user_pc += 4;
@@ -604,30 +789,71 @@ void boot(void) {
         : [stack_top] "r" (__stack_top) // Pass the stack top address as %[stack_top]
     );
 }
+
+void test_thread_entry(void) {
+    while (1) {
+        printf("[TestThread] Hello from thread %d in process %d\n",
+               current_thread->tid, current_proc->pid);
+        yield();
+    }
+}
+
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
+    __asm__ __volatile__("csrw sscratch, sp\n");
+
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
-
-    virtio_blk_init(); // new
-
+    virtio_blk_init();
     fs_init();
 
     char buf[SECTOR_SIZE];
     read_write_disk(buf, 0, false /* read from the disk */);
     printf("first sector: %s\n", buf);
-
     strcpy(buf, "hello from kernel!!!\n");
     read_write_disk(buf, 0, true /* write to the disk */);
 
-    idle_proc = create_process(NULL, 0); // updated!
+
+
+    printf("look look\n");
+    idle_proc = create_process(NULL, 0);
     idle_proc->pid = -1; // idle
     current_proc = idle_proc;
 
-    // new!
+    uint32_t *idle_sp = (uint32_t *)&idle_thread.stack[sizeof(idle_thread.stack)];
+    // 同樣 push s0..s11, ra
+    *--idle_sp = 0; // s11
+    *--idle_sp = 0; // s10
+    *--idle_sp = 0; // s9
+    *--idle_sp = 0; // s8
+    *--idle_sp = 0; // s7
+    *--idle_sp = 0; // s6
+    *--idle_sp = 0; // s5
+    *--idle_sp = 0; // s4
+    *--idle_sp = 0; // s3
+    *--idle_sp = 0; // s2
+    *--idle_sp = 0; // s1
+    *--idle_sp = 0; // s0
+    *--idle_sp = 0; // ra (或者不一定要放 function)
+    idle_thread.sp = (uint32_t) idle_sp;
+    idle_thread.state = THREAD_RUNNABLE;
+
+    idle_thread.tid = -1; // 初始化 idle_thread
+    idle_thread.parent = idle_proc;
+    current_thread = &idle_thread;
+
+    // PANIC("should never return to kernel_main if all run fine");
     create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
 
-    yield(); // enter user mode
+    printf("current_proc->pid: %d\n", current_proc->pid);
+    printf("current_thread->tid: %d\n", current_thread->tid);
+    printf("current_thread->sp: %x\n", current_thread->sp);
+    printf("current_proc->page_table: %x\n", current_proc->page_table);
+    printf("current_proc->state: %d\n", current_proc->state);
+    printf("current_thread->state: %d\n", current_thread->state);
+
+
+    yield();
 
     PANIC("switched to idle process");
 
@@ -636,6 +862,7 @@ void kernel_main(void) {
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
+
     __asm__ __volatile__(
         // Save callee-saved registers onto the current process's stack.
         "addi sp, sp, -13 * 4\n" // Allocate stack space for 13 4-byte registers
@@ -653,9 +880,16 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
         "sw s10, 11 * 4(sp)\n"
         "sw s11, 12 * 4(sp)\n"
 
+        "fence rw, rw\n"         // Memory fence
+
+
         // Switch the stack pointer.
         "sw sp, (a0)\n"         // *prev_sp = sp;
         "lw sp, (a1)\n"         // Switch stack pointer (sp) here
+
+
+        "fence rw, rw\n"         // Memory fence
+
 
         // Restore callee-saved registers from the next process's stack.
         "lw ra,  0  * 4(sp)\n"  // Restore callee-saved registers only

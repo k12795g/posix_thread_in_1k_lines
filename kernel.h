@@ -60,6 +60,24 @@ struct trap_frame {
         __asm__ __volatile__("csrw " #reg ", %0" ::"r"(__tmp));                \
     } while (0)
 
+#define THREADS_MAX 16
+
+#define THREAD_UNUSED   0
+#define THREAD_RUNNABLE 1
+#define THREAD_EXITED   2
+
+
+struct thread {
+    int tid;
+    int state;
+    uint32_t sp;               // 這支 thread 的 kernel stack pointer（切換時要用到）
+    uint8_t stack[4096];       // 假設給定一個簡單大小
+    struct process *parent;    // 指回它所屬的 process（共用 page_table）
+    uint32_t func;
+    // ... 還可以加別的 ...
+};
+
+
 #define PROCS_MAX 8       // Maximum number of processes
 
 #define PROC_UNUSED   0   // Unused process control structure
@@ -67,12 +85,18 @@ struct trap_frame {
 #define PROC_EXITED   2   // Exited process
 
 struct process {
-    int pid;             // Process ID
-    int state;           // Process state: PROC_UNUSED or PROC_RUNNABLE
-    vaddr_t sp;          // Stack pointer
-    uint32_t *page_table;
-    uint8_t stack[8192]; // Kernel stack
+    int pid;
+    int state;
+
+    uint32_t *page_table;    // 行程的 page table
+    // 以前的 stack[]、sp 可能就不放在這了 (或者留給「主 thread」也行)
+
+    // 這個 process 裏的 threads
+    struct thread threads[THREADS_MAX];
+    int next_tid;
+    // ... 其它 process 層級的東西 ...
 };
+
 
 #define SATP_SV32 (1u << 31)
 #define PAGE_V    (1 << 0)   // "Valid" bit (entry is enabled)
